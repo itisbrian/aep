@@ -1,0 +1,109 @@
+#!/bin/bash
+
+##################################
+
+
+DIR=$1
+
+usage () {
+  echo "--------------------------------------------------------------------------------------------------------------------------------"
+  echo " "
+  echo "This script will copy all the logs and push them to the cburn directory on the 16 network."
+  echo "Please make sure system is connected to the 16 network."
+  echo "ex: gfb_push /sysv/brian/aep -> /burnin/sysv/brian/aep  "
+  echo " "
+  echo "--------------------------------------------------------------------------------------------------------------------------------"
+}
+
+
+if [ $# -lt 1 ]; then
+  usage
+  echo " "
+  echo -n "Enter directory and press [ENTER]:  "
+  read input
+  read -p "You entered : ${input} , enter [y] to confirm. `echo $'\n> '`" -n 1 -r
+  if [[ $REPLY =~ ^[Yy]$ ]]; then
+      DIR=${input}
+      echo " "
+      echo "Your DIR = ${input}."
+  else
+      echo " "
+      echo "Input unconfirmed, please try again."
+      echo "Exiting."
+      exit 1
+  fi
+fi
+
+function joinpath {
+  rp='/mnt/'
+  if [[ ${DIR:0:1} == "/" ]] && [[ ${DIR: -1} != "/" ]]; then
+      np=${DIR:1}
+      lp="$rp$np"
+
+  elif [[ ${DIR:0:1} == "/" ]] && [[ ${DIR: -1} == "/" ]]; then
+      np=${DIR:1:-1}
+      lp="$rp$np" 
+  elif [[ ${DIR:0:1} != "/" ]] && [[ ${DIR: -1} != "/" ]] ; then
+      lp="$rp$DIR"
+  elif [[ ${DIR:0:1} != "/" ]] && [[ ${DIR: -1} == "/" ]] ; then
+      np=${DIR::-1}
+      lp="$rp$np"
+
+  else
+      echo "Incorrect directory format detected, use the following format:"
+      echo "/sysv/brian/aep"
+      echo "sysv/brian/aep"
+      exit 1
+  fi 
+} 
+
+
+
+joinpath
+
+echo " "
+echo "Mounting 172.16.0.3:/burnin to /mnt...."
+mount 172.16.0.3:/burnin /mnt
+if [[ $? -ne 0 ]]; then
+    echo "Error mounting cburn directory."
+    echo "Please try again."
+    exit 1
+fi
+echo "Mount successful."
+
+function checkdir {
+    if [ -d ${lp} ]; then
+      echo "Directory exists, copying files."
+
+    elif [ ! -d ${lp} ]; then
+      echo "Creating directory : ${lp}"
+      mkdir ${lp}
+    fi  
+
+}
+
+checkdir
+
+
+
+function push {
+
+for i in `ls /var/log | grep -i greenfireball*`; do
+    echo "Pushing Files: "
+    echo "${i}"
+    cp /var/log/${i} ${lp}
+    echo "Pushing gfb run directory."
+    cp -r /root/green_fireball/run ${lp}
+    dmesg >> /root/green_fireball/dmesg.log
+    echo "Pushing dmesg."
+    cp /root/green_fireball/dmesg.log ${lp}
+done
+
+
+
+}
+
+push
+echo " "
+echo "End of Push"
+ echo "--------------------------------------------------------------------------------------------------------------------------------"

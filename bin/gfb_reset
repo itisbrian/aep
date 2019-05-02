@@ -1,0 +1,39 @@
+#!/bin/bash
+
+
+#Reset the json to the original without stopping the service
+
+#check if file exists, if it does, remove it. check all errors.
+
+function gfb_reset () {
+
+if [ -e /root/green_fireball/run/gfb_config.json ] ; then
+#	echo " File Found. "
+#	echo " Removing file..."
+	rm -f /root/green_fireball/run/gfb_config.json
+	if [ $? -ne 0 ] ; then
+		echo "Error when trying to remove file. "
+		return -1
+	fi
+	echo " Removal Complete. "
+else
+	echo "File not found."
+	return -2
+fi
+
+if [ -e /var/log/greenfireball.log ]; then
+	DATE=`date +%s`
+	cp  -a /var/log/greenfireball.log /var/log/greenfireball_${DATE}.log
+	if [ $? -ne 0 ]; then
+		echo "Error handling archiving of old log"
+		return -3
+	fi
+	rm -f /var/log/greenfireball.log
+fi
+
+}
+
+gfb_reset
+exit $?
+
+

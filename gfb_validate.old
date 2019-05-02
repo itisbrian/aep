@@ -1,0 +1,1059 @@
+#!/usr/bin/python2.7
+
+import os
+import sys
+import argparse
+
+import pprint
+
+from aep_gfb.config import *
+from aep_gfb.generic import *
+from aep_gfb.ipmctl import *
+from aep_gfb.ndctl import *
+from aep_gfb.fio import *
+
+def diagnostics(config):
+	#Cancel.
+	return 0
+
+	global IGNORE_WARN
+	errorDetail = []
+	for dimm in config['dimms']:
+		for diag in diagnostic_list:
+			ecode = diagnostic(dimm, diag)
+
+			if ecode:
+				if isinstance(ecode, int):
+					errorDetail.append("DIMM %s failed diagnostic `%s` with retc %d" % (dimm, diag, ecode) )
+				else:
+					if IGNORE_WARN and ecode == "Warning":
+						continue
+					errorDetail.append("DIMM %s failed diagnostic `%s` with data %s" % (dimm, diag, ecode) )
+
+	if len(errorDetail) > 0:
+		wlprint("ERROR: Issues with diagnostics.")
+		for entry in errorDetail:
+			wlprint("\t%s" % entry)
+
+	return len(errorDetail)
+
+#This should probably be moved to ipmctl?
+def dimmCompare(originalSet, newSet):
+	for entry in originalSet:
+		if entry not in newSet:
+			return -1
+
+	for entry in newSet:
+		if entry not in originalSet:
+			return -2
+
+	return 0
+
+#Create non-interleaved appdirect goals
+def createNIGoals(percentage):
+	wlprint("Assigning Non-interleaved goal of %s%%, will reboot." % percentage)
+	data = setGoal(percentage, "AppDirectNotInterleaved", None, True) #This should reboot immediately
+	time.sleep(120)
+	sys.exit(0)
+
+#Create interleaved appdirect goals
+def createGoals(percentage):
+	wlprint("Assigning goal of %s%%, will reboot." % percentage)
+	data = setGoal(percentage, "AppDirect", None, True) #This should reboot immediately
+	time.sleep(120)
+	sys.exit(0)
+
+#This expects to be called via list_region() output.
+def createAllNamespaces(regions):
+	if len(regions) == 0: #No regions found or provided
+		return -1
+	errors = 0
+
+	for entry in regions:
+		data = create_ns_iset(entry['iset_id'])
+		if len(data) == 0:
+			wlprint("ERROR: Failed to create region on isetid %s" % entry['iset_id'])
+			errors += 1
+
+	return errors
+
+def nextTestPass(configfile, configjson):
+	global CONFIGJ
+	global CONFIGFP
+	try:
+		CONFIGJ = nextTest(CONFIGJ)
+		writeConfig(CONFIGJ, CONFIGFP)
+	except:
+		CONFIGJ['current'] = None
+		writeConfig(CONFIGJ, CONFIGFP)
+		wlprint("\n\nFinished!\n\n")
+		wlprint("Testing completed successfully.")
+		sys.exit(0)
+
+
+#Compare previously saved goal information.
+# +- 9% is fine to account for max alignment offsets. (Specifically, 100% appdirect allocation)
+#
+# This does validation of goal settings (Region instantiation) on reboot for us as well
+# THIS IS ONLY FOR NON-INTERLEAVED GOALS
+def compareRegionsToNIPGoals(goal):
+	regionL = getRegion()
+	dimmL = getDIMMs()
+	goal = float(goal)
+	error = False
+	for entry in dimmL:
+		for regionE in regionL:
+			if entry == regionE['DimmID']:
+				regionS = float(regionE['Capacity'].split(' ')[0])
+				dimmS = float(dimmL[entry]['capacity'])
+				min = 0.09
+				max = 0.09
+				goalCalc = float(1.0) - (regionS/dimmS)
+				goalCalcMin = goalCalc - min
+				if goalCalcMin < 0:
+					goalCalcMin = 0
+
+				goalCalcMax = goalCalc + max
+				if goalCalcMax > 100:
+					goalCalcMax = 100
+
+				if (goal < goalCalcMin) or (goal > goalCalcMax):
+					#Issue error
+					wlprint("ERROR: calculated goal for dimm %s (%f) doesn't match region (%f)" % (entry, goal, goalCalc) )
+					error = True
+
+	if error:
+		wlprint("ERROR: compareRegionsToNIPGoals failed.")
+		sys.exit(2) #I dunno if we should return here or not
+
+	return None
+
+# Perform FIO on raw pmem device
+# This can be one at a time, or all at once.
+# pmems = list of pmem devices
+
+def performIO(pmems, rwmode, single=False):
+	quickFio(pmems, rwmode, None, single)
+
+def fsPrepareCombo(pmemE, fs, partS, rwmode, single=False, unmountI=True):
+	smsg = "%s %s %s%% mode %s" % (pmemE, fs, str(partS), rwmode )
+	print("fsPrepareCombo against `%s`" % smsg)
+	if createGPTLabel(pmemE):
+		wlprint("ERROR: fsPrepareCombo failed at createGPTLabel with %s" % smsg)
+		return 1
+
+	time.sleep(1)
+
+	if createGPTPartition(pmemE, 0, int(partS) ):
+		wlprint("ERROR: fsPrepareCombo failed at createGPTPartition with %s" % smsg)
+		return 2
+
+	time.sleep(1)
+
+	partP = pmemE.split("/")[-1]
+	partE = "%sp1" % pmemE
+	partEP = partE.split("/")[-1]
+
+	#Partitiion split so we get partial path
+#	part_re = "(pmem\d+)p(\d+)"
+#	part_s = part_re.search(partP)
+#	if not part_s:
+#		wlprint("ERROR fsPrepareCombo failed partition regex")
+#		return 3
+
+#	if mkfsd(fs, pmemE):
+	if mkfsd(fs, partE):
+		wlprint("ERROR: fsPrepareCombo failed at mkfsd with %s" % smsg)
+		return 3
+
+	mountPoint = "/media/%s" % partP
+	#Make directory /media/partP
+	if lmkdir(mountPoint):
+		wlprint("ERROR: fsPrepareCombo could not make mountpoint at %s" % mountPoint)
+		return 4
+
+	# if mountDiskD(pmemE, mountPoint):
+	if mountDiskD(partE, mountPoint):
+		wlprint("ERROR: fsPrepareCombo could not mount disk %s to %s" % (smsg, mountPoint) )
+		return 5
+
+	if flushCache():
+		wlprint("ERROR: fsPrepareCombo failed at flushcache with %s" % smsg)
+		return 6
+
+	# if quickFio([ pmemE ], rwmode, "%s/fio" % mountPoint, single):
+	if quickFio([ partE ], rwmode, "%s/fio" % mountPoint, single, str(partEP + fs + rwmode) ):
+		wlprint("ERROR: fsPrepareCombo failed at quickFio with %s" % smsg)
+		return 7
+
+	if flushCache():
+		wlprint("ERROR: fsPrepareCombo failed at second flushcache with %s" % smsg)
+		return 8
+
+
+	# unmount(pmemE)
+	if unmountI:
+		unmount(partE)
+
+	return 0
+
+
+
+# Perform partitioning tests against a pmem device list, one at a time in series.
+def performPartitionTest(pmems, rwmode):
+	errors = []
+	for entry in pmems:
+		pmemE = entry
+		if not entry.startswith("/dev/"):
+			pmemE = "/dev/%s" % entry
+
+		# for partperc in [ 25, 50, 100 ]:
+			# for partfs in [ "ext4", "xfs", "btrfs" ]
+		for partperc in [ 25, 50, 75, 100 ]:
+			for partfs in [ "xfs", "btrfs", "ext4" ]:
+				fspc_ret = fsPrepareCombo(pmemE, partfs, partperc, rwmode, True)
+				if fspc_ret:
+					errors.append("%s/%s/%s failed with retc %d" % (pmemE, partfs, str(partperc), fspc_ret))
+					continue
+	if len(errors) > 0:
+		wlprint("ERRORS under performPartitionTest:")
+		for entry in errors:
+			wlprint("\t- %s" % entry)
+
+	return len(errors)
+
+
+def powerCyclePreRun(pmems):
+	errors = []
+
+	if not os.path.exists("/var/lib/green_fireball"):
+		try:
+			os.mkdir("/var/lib/green_fireball")
+		except:
+			wlprint("ERROR: Failure to create varfs entry /var/lib/green_fireball")
+
+	for entry in pmems:
+		pmemE = entry
+		if not entry.startswith("/dev/"):
+			pmemE = "/dev/%s" % entry
+
+		#XFS is the most problematic FS when it comes to consistency
+		fspc_ret = fsPrepareCombo(pmemE, "xfs", 100, "write", True, False)
+		if fspc_ret:
+			errors.append("%s failed with retc %d when writing to filesystem" % (pmemE, fspc_ret))
+			continue
+
+		#Strip off the dev from pmemE:
+		pmem_path = pmemE.split('/')[-1]
+
+		for file in glob.glob("/media/%s/fio" % pmem_path):
+			#If we have a file
+			if os.path.isfile(file):
+				#sha256 hash it!
+				retd = getProcAll(["/usr/bin/sha256sum", file])
+				if retd['ret'] != 0:
+					errors.append("Sha256 summing of %s failed with %d" % (file, retd['ret']))
+					continue
+
+				#We want to write to /var/lib/gfb_validate/${file}.sha256
+
+
+
+
+
+
+
+#
+# This runs an FIO test against the pmem devices under multiple filesystems and the raw block device in a manner that provides
+# us with the highest throughput per disk [given previous peak results]
+#
+def performSpecTest():
+	#Test each dimm one at a time, file-system-free
+	#Test all dimms at once, file-system-free
+
+	#Partition each pmem under xfs, ext4 and btrfs
+		#create FS
+		#mount FS
+		#Run each dimm one at a time
+		#Flush caches
+		#Run all dimms at once
+
+	#Dump a summary table so user can look over the results, issue warnings if throughput numbers are below a certain
+	# value
+	pass
+
+def performSecureEraseTest(pmems):
+	#Secure erase each pmem
+	pass
+
+#
+# We assign password to each region/dimm/whatever then power cycle
+#
+def performPasswordLockTest(pmems, password):
+	pass
+
+#
+# Unlock and ensure that we can see all the namespace uuid's and that we can mount and write data to them
+#
+def performPasswordUnlockTest(pmems, password):
+	pass
+
+
+
+if __name__=="__main__":
+	global IGNORE_WARN
+
+	global LOGFILE
+	global CONFIGFP
+	global CONFIGJ
+
+	LOGFILE="gfb_validate.log"
+	CONFIGF="gfb_config.json"
+	CONFIGFP=CONFIGF
+
+	IGNORE_WARN = False
+
+	cmdAP = argparse.ArgumentParser(description="Perform validation sequencing against AEP DIMM's")
+	cmdAP.add_argument('-l', dest="log", default=LOGFILE, help="Path to logfile")
+	cmdAP.add_argument('-d', dest="directory", default=os.getcwd(), help="Path to consistency directory")
+	cmdAP.add_argument('--nowarn', dest="i_warn", action='store_true', default=False, help="Ignore warnings")
+	cmdAP.add_argument('--tty', dest="tty_in", default=None, help="If you want to auto-switch to a tty, add the tty name or number here.")
+#	cmdAP.add_argument('--tests', dest=tests, default=None, help="List of tests to perform.  Consult the manpage.")
+
+	args = cmdAP.parse_args()
+
+	LOGFILE = args.log
+
+	os.environ['LOGFILE'] = str(LOGFILE)
+
+	IGNORE_WARN = args.i_warn
+
+
+	CONFIGFP="%s/gfb_config.json" % args.directory
+	CONFIGJ=None
+
+	#Load config
+	if not os.path.exists(CONFIGFP):
+		CONFIGJ = initConfig()
+
+		#Copy back tests
+		if len(CONFIGJ['remaining']) == 0:
+			CONFIGJ['remaining'] = copy.copy(CONFIGJ['tests'])
+
+		CONFIGJ['dimms'] = getDIMMs()
+
+		writeConfig(CONFIGJ, CONFIGFP)
+
+	CONFIGJ = getConfig(CONFIGFP)
+
+	#Get `current` entry and execute the associated test
+	if not CONFIGJ['current']:
+		CONFIGJ = nextTest(CONFIGJ)
+
+	# If tty is set so that we can auto-switch, start runnin' that now!
+	if args.tty_in:
+		#We need to be able to switch to the correct tty with any of the following input:
+		#	/dev/tty1
+		#	tty1
+		#	1
+		ttyid = args.tty_in
+		if args.tty_in.startswith("/dev/tty"):
+			ttyid = args.tty_in[8:]
+		
+		if args.tty_in.startswith("tty"):
+			ttyid = args.tty_in[3:]
+
+		#It's probably easiest to whittle it down to the smallest common denominator.
+		retc = getProcRC(["/usr/bin/chvt", ttyid])
+		if retc:
+			print("Got bad return code from chvt %d" % retc)
+
+
+
+	#Get list of dimms
+	dimmList = getDIMMs()
+	if len(dimmList) == 0:
+		wlprint("ERROR: No AEP DIMMs found in system")
+		sys.exit(1)
+
+	if dimmCompare(CONFIGJ['dimms'], dimmList):
+		wlprint("ERROR: DIMM Mismatch found!")
+		sys.exit(2)
+
+	if CONFIGJ['current'] == "pre_initialization":
+		CONFIGJ = nextTest(CONFIGJ)
+		writeConfig(CONFIGJ, CONFIGFP)
+
+		if clearConfig():
+			wlprint("ERROR: pre_initialization failed")
+			sys.exit(3)
+
+		sys.exit(0)
+
+	#Test sequencing section!
+	#We need to actually run diagnostics before init too;
+	if CONFIGJ['current'] == "initialization":
+		wlprint("#### Beginning initialization...")
+
+		if delete_all():
+			wlprint("ERROR: Could not delete all namespaces")
+			sys.exit(4)
+
+#DISABLING DIAGNOSTICS INITIALLY.  THESE SHOULD RUN IN PRODUCTION
+		# out = diagnostics(CONFIGJ)
+		# if out:
+		# 	sys.exit(3)
+
+		#Just call clearGoal; let it do whatever.  We don't care about return codes
+		clearGoal(ignore=True)
+
+		#For the base init, we want to set the size to 100%
+		#We're also rebooting
+		CONFIGJ = nextTest(CONFIGJ)
+		CONFIGJ['goal'] = 50
+
+		#Initial goal should be 50%
+#		out = createNIGoals(50)
+
+		writeConfig(CONFIGJ, CONFIGFP)
+		out = setGoal(50, "AppDirectNotInterleaved", None, True)
+		if out:
+			wlprint("ERROR: Could not set goal during initialization.")
+			sys.exit(4)
+
+
+
+		#Patrick
+		print("Should be rebooting; but you probably cancelled it.")
+		#Sleep for 3 minutes and then exit hard
+		time.sleep(180)
+		sys.exit(0)
+
+	#Perform first configured boot diagnostics
+	if CONFIGJ['current'] == "diagnostics":
+		wlprint("#### Diagnostic section")
+		out = diagnostics(CONFIGJ)
+		if out != 0:
+			sys.exit(3)
+
+		#Check the region percentage data
+
+		CONFIGJ = nextTest(CONFIGJ)
+		writeConfig(CONFIGJ, CONFIGFP)
+
+
+	if CONFIGJ['current'] == "gval_50p":
+		wlprint("#### Validation of 50%% goal")
+		#No reboot
+		if compareRegionToGoal(CONFIGJ['goal'], False):
+			wlprint("ERROR: Goal does not match region dump.")
+			sys.exit(5)
+
+		CONFIGJ['regions'] = getRegionDetails()
+		CONFIGJ = nextTest(CONFIGJ)
+		writeConfig(CONFIGJ, CONFIGFP)
+
+	#
+	# Reboot should have occurred before reaching here
+	#
+
+
+	#Performance test at 50%
+	if CONFIGJ['current'] == "perfTest_50p":
+		wlprint("#### Performance test at 50%%")
+		if createAllNamespaces(list_region()):
+			wlprint("ERROR: perfTest_50p failed when creating namespaces")
+
+
+
+		namespaces = list_namespace()
+
+		pmems = []
+		for namespace in namespaces:
+			try:
+				pmems.append("/dev/%s" % str(namespace['blockdev']))
+			except:
+				wlprint("ERROR: perfTest_50p could not add namespace entry: `%s`" % str(namespace))
+				sys.exit(7)
+
+
+		if performIO(pmems, "write", True):
+			wlprint("ERROR: perftest50p could not perform IO against `%s`" % str(pmems))
+			sys.exit(8)
+
+		#If we're operating in 50/50 mode; we may need to deal with extremely high read drops due to
+		# the memory getting utilized.
+
+		validation = validateResults(validateResultsInData(writebw=(1100*len(pmems)*1000000)),formulateResults(FIOOutFile))
+		if validation:
+			wlprint("ERROR: Throughput validation failed for perfTest_50p write")
+
+		if performIO(pmems, "read", True):
+			wlprint("ERROR: perftest50p could not perform read IO against `%s`" % str(pmems))
+			sys.exit(9)
+
+		validation = validateResults(validateResultsInData(readbw=(5000*len(pmems)*1000000)),formulateResults(FIOOutFile))
+		if validation:
+			wlprint("ERROR: Throughput validation failed for perfTest_50p read")
+			sys.exit(10)
+
+		# CONFIGJ = nextTest(CONFIGJ)
+		# writeConfig(CONFIGJ, CONFIGFP)
+		nextTestPass(CONFIGFP, CONFIGJ)
+
+	# With caching overhead from the 50/50 ratio; there will be performance issues.
+	# Expect reads to have min avgs in the 10G area.  Writes will still be crappy but should not
+	# be as heavily impacted.
+	if CONFIGJ['current'] == "partTest_50p":
+		wlprint("#### Partition test at 50%%")
+		namespaces = list_namespace()
+
+		pmems = []
+		for namespace in namespaces:
+			try:
+				pmems.append("/dev/%s" % str(namespace['blockdev']))
+			except:
+				wlprint("ERROR: partTest_50p could not add namespace entry: `%s`" % str(namespace))
+				sys.exit(11)
+
+		parttest = performPartitionTest(pmems, "write")
+		if parttest:
+			wlprint("ERROR: partTest_50p failed performPartitionTest")
+			sys.exit(12)
+
+		for disk in pmems:
+			partP = disk.split("/")[-1]
+			partE = "%sp1" % disk
+			partEP = partE.split("/")[-1]
+			for fs in [ "xfs", "btrfs", "ext4" ]:
+				validation = validateResults(validateResultsInData(writebw=(1100*1000000)),formulateResults(FIOOutFile + partEP + fs + "write"))
+				if validation:
+					wlprint("ERROR: Throughput validation failed for partTest_50p write")
+					sys.exit(15)
+
+		parttest = performPartitionTest(pmems, "read")
+		if parttest:
+			wlprint("ERROR: partTest_50p failed performPartitionTest")
+			sys.exit(14)
+
+		for disk in pmems:
+			partP = disk.split("/")[-1]
+			partE = "%sp1" % disk
+			partEP = partE.split("/")[-1]
+			for fs in [ "xfs", "btrfs", "ext4" ]:
+				validation = validateResults(validateResultsInData(readbw=(5200*1000000)),formulateResults(FIOOutFile + partEP + fs + "read"))
+				if validation:
+					wlprint("ERROR: Throughput validation failed for partTest_50p read")
+					sys.exit(15)
+
+		# CONFIGJ = nextTest(CONFIGJ)
+		# writeConfig(CONFIGJ, CONFIGFP)
+		nextTestPass(CONFIGFP, CONFIGJ)
+
+
+	if CONFIGJ['current'] == "goal_clear_50p":
+		wlprint("#### Clearing 50% goal")
+		if delete_all():
+			wlprint("ERROR: Could not delete all namespaces")
+			sys.exit(16)
+
+		clearGoal(ignore=True)
+
+		CONFIGJ = nextTest(CONFIGJ)
+		writeConfig(CONFIGJ, CONFIGFP)
+		# out = setGoal(100, "AppDirectNotInterleaved", None, True)
+		out = setGoal(100, None, None, True)
+		if out:
+			wlprint("ERROR: Could not set goal during initialization.")
+			sys.exit(17)
+
+		#Patrick
+		print("Should be rebooting; but you probably cancelled it.")
+		#Sleep for 3 minutes and then exit hard
+		time.sleep(180)
+		sys.exit(0)
+
+# 0% util section
+	if CONFIGJ['current'] == "goal_0p":
+		wlprint("#### Beginning 0% memorymode goal")
+
+		if delete_all():
+			wlprint("ERROR: Could not delete all namespaces")
+			sys.exit(16)
+
+#DISABLING DIAGNOSTICS INITIALLY.  THESE SHOULD RUN IN PRODUCTION
+		# out = diagnostics(CONFIGJ)
+		# if out:
+		# 	sys.exit(3)
+
+		#Just call clearGoal; let it do whatever.  We don't care about return codes
+		clearGoal(ignore=True)
+
+		#We're also rebooting
+		CONFIGJ = nextTest(CONFIGJ)
+		CONFIGJ['goal'] = 0
+
+
+		writeConfig(CONFIGJ, CONFIGFP)
+		out = setGoal(CONFIGJ['goal'], "AppDirectNotInterleaved", None, True)
+		if out:
+			wlprint("ERROR: Could not set goal during initialization.")
+			sys.exit(17)
+
+
+
+		#Patrick
+		#Sleep for 3 minutes and then exit hard
+		time.sleep(180)
+		sys.exit(0)
+
+	if CONFIGJ['current'] == "gval_0p":
+		wlprint("#### Validating 0% goal")
+		#No reboot
+		if compareRegionToGoal(CONFIGJ['goal'], False):
+			wlprint("ERROR: Goal does not match region dump.")
+			sys.exit(18)
+
+		CONFIGJ['regions'] = getRegionDetails()
+		# CONFIGJ = nextTest(CONFIGJ)
+		# writeConfig(CONFIGJ, CONFIGFP)
+		nextTestPass(CONFIGFP, CONFIGJ)
+
+
+#Performance test at 50%
+	if CONFIGJ['current'] == "perfTest_0p":
+		wlprint("#### Performance Test at 0%")
+		if createAllNamespaces(list_region()):
+			wlprint("ERROR: perfTest_0p failed when creating namespaces")
+			sys.exit(19)
+
+		namespaces = list_namespace()
+
+		pmems = []
+		for namespace in namespaces:
+			try:
+				pmems.append("/dev/%s" % str(namespace['blockdev']))
+			except:
+				wlprint("ERROR: perfTest_0p could not add namespace entry: `%s`" % str(namespace))
+				sys.exit(20)
+
+
+		if performIO(pmems, "write", True):
+			wlprint("ERROR: perftest_0p could not perform IO against `%s`" % str(pmems))
+			sys.exit(21)
+
+		#If we're operating in 50/50 mode; we may need to deal with extremely high read drops due to
+		# the memory getting utilized.
+
+		validation = validateResults(validateResultsInData(writebw=(1100*len(pmems)*1000000)),formulateResults(FIOOutFile))
+		if validation:
+			wlprint("ERROR: Throughput validation failed for perfTest_0p write")
+
+		if performIO(pmems, "read", True):
+			wlprint("ERROR: perftest0p could not perform read IO against `%s`" % str(pmems))
+			sys.exit(22)
+
+		#Lowered to 15GB due to some inconsistencies that appear.
+		# As long as we're only sampling once; this is always a possibility.
+		validation = validateResults(validateResultsInData(readbw=(15000*len(pmems)*1000000)),formulateResults(FIOOutFile))
+		if validation:
+			wlprint("ERROR: Throughput validation failed for perfTest_0p read")
+			sys.exit(23)
+
+		# CONFIGJ = nextTest(CONFIGJ)
+		# writeConfig(CONFIGJ, CONFIGFP)
+		nextTestPass(CONFIGFP, CONFIGJ)
+
+	# With caching overhead from the 50/50 ratio; there will be performance issues.
+	# Expect reads to have min avgs in the 10G area.  Writes will still be crappy but should not
+	# be as heavily impacted.
+	if CONFIGJ['current'] == "partTest_0p":
+		wlprint("#### Partition Test at 0%")
+		namespaces = list_namespace()
+
+		pmems = []
+		for namespace in namespaces:
+			try:
+				pmems.append("/dev/%s" % str(namespace['blockdev']))
+			except:
+				wlprint("ERROR: partTest_0p could not add namespace entry: `%s`" % str(namespace))
+				sys.exit(11)
+
+		parttest = performPartitionTest(pmems, "write")
+		if parttest:
+			wlprint("ERROR: partTest_0p failed performPartitionTest")
+			sys.exit(12)
+
+		for disk in pmems:
+			partP = disk.split("/")[-1]
+			partE = "%sp1" % disk
+			partEP = partE.split("/")[-1]
+			for fs in [ "xfs", "btrfs", "ext4" ]:
+				validation = validateResults(validateResultsInData(writebw=(1100*1000000)),formulateResults(FIOOutFile + partEP + fs + "write"))
+				if validation:
+					wlprint("ERROR: Throughput validation failed for partTest_0p write")
+					sys.exit(15)
+
+		parttest = performPartitionTest(pmems, "read")
+		if parttest:
+			wlprint("ERROR: partTest_0p failed performPartitionTest")
+			sys.exit(14)
+
+		for disk in pmems:
+			partP = disk.split("/")[-1]
+			partE = "%sp1" % disk
+			partEP = partE.split("/")[-1]
+			for fs in [ "xfs", "btrfs", "ext4" ]:
+				validation = validateResults(validateResultsInData(readbw=(5200*1000000)),formulateResults(FIOOutFile + partEP + fs + "read"))
+				if validation:
+					wlprint("ERROR: Throughput validation failed for partTest_0p read")
+					sys.exit(15)
+
+		nextTestPass(CONFIGFP, CONFIGJ)
+		# try:
+		# 	CONFIGJ = nextTest(CONFIGJ)
+		# 	writeConfig(CONFIGJ, CONFIGFP)
+		# except:
+		# 	CONFIGJ = None
+		# 	writeConfig(CONFIGJ, CONFIGFP)
+		# 	wlprint("\n\nFinished!\n\n")
+		# 	wlprint("Testing completed successfully.")
+
+
+	if CONFIGJ['current'] == "goal_clear_0p":
+		wlprint("#### Clearing 0% goal")
+		if delete_all():
+			wlprint("ERROR: Could not delete all namespaces")
+			sys.exit(16)
+
+		clearGoal(ignore=True)
+
+		CONFIGJ = nextTest(CONFIGJ)
+		writeConfig(CONFIGJ, CONFIGFP)
+		# out = setGoal(100, "AppDirectNotInterleaved", None, True)
+		out = setGoal(100, None, None, True)
+		if out:
+			wlprint("ERROR: Could not set goal during initialization.")
+			sys.exit(17)
+
+		time.sleep(180)
+		sys.exit(0)
+
+#25% Goal tests
+	if CONFIGJ['current'] == "goal_25p":
+		wlprint("#### Beginning 25% memorymode goal")
+
+		# if delete_all():
+		# 	wlprint("ERROR: Could not delete all namespaces")
+		# 	sys.exit(16)
+
+#DISABLING DIAGNOSTICS INITIALLY.  THESE SHOULD RUN IN PRODUCTION
+		# out = diagnostics(CONFIGJ)
+		# if out:
+		# 	wlprint("Diagnostic sequence failed for 25% MM goal.")
+		# 	sys.exit(3)
+
+		#Just call clearGoal; let it do whatever.  We don't care about return codes
+		clearGoal(ignore=True)
+
+		#We're also rebooting
+		CONFIGJ = nextTest(CONFIGJ)
+		CONFIGJ['goal'] = 25
+
+
+		writeConfig(CONFIGJ, CONFIGFP)
+		out = setGoal(CONFIGJ['goal'], "AppDirectNotInterleaved", None, True)
+		if out:
+			wlprint("ERROR: Could not set goal during initialization.")
+			sys.exit(17)
+
+		#Patrick
+		#Sleep for 3 minutes and then exit hard
+		time.sleep(180)
+		sys.exit(0)
+
+	if CONFIGJ['current'] == "gval_25p":
+		wlprint("#### Validating 25% goal")
+		#No reboot
+		if compareRegionToGoal(CONFIGJ['goal'], False):
+			wlprint("ERROR: Goal does not match region dump.")
+			sys.exit(18)
+
+		CONFIGJ['regions'] = getRegionDetails()
+		nextTestPass(CONFIGFP, CONFIGJ)
+
+#Performance test at 25%
+	if CONFIGJ['current'] == "perfTest_25p":
+		wlprint("#### Performance Test at 25%")
+		if createAllNamespaces(list_region()):
+			wlprint("ERROR: perfTest_25p failed when creating namespaces")
+			sys.exit(19)
+
+		namespaces = list_namespace()
+
+		pmems = []
+		for namespace in namespaces:
+			try:
+				pmems.append("/dev/%s" % str(namespace['blockdev']))
+			except:
+				wlprint("ERROR: perfTest_25p could not add namespace entry: `%s`" % str(namespace))
+				sys.exit(20)
+
+
+		if performIO(pmems, "write", True):
+			wlprint("ERROR: perftest_25p could not perform IO against `%s`" % str(pmems))
+			sys.exit(21)
+
+		#If we're operating in 50/50 mode; we may need to deal with extremely high read drops due to
+		# the memory getting utilized.
+
+		validation = validateResults(validateResultsInData(writebw=(1100*len(pmems)*1000000)),formulateResults(FIOOutFile))
+		if validation:
+			wlprint("ERROR: Throughput validation failed for perfTest_25p write")
+
+		if performIO(pmems, "read", True):
+			wlprint("ERROR: perftest_25p could not perform read IO against `%s`" % str(pmems))
+			sys.exit(22)
+
+		#Lowered to 15GB due to some inconsistencies that appear.
+		# As long as we're only sampling once; this is always a possibility.
+		validation = validateResults(validateResultsInData(readbw=(15000*len(pmems)*1000000)),formulateResults(FIOOutFile))
+		if validation:
+			wlprint("ERROR: Throughput validation failed for perfTest_25p read")
+			sys.exit(23)
+
+		nextTestPass(CONFIGFP, CONFIGJ)
+
+	# With caching overhead from the 50/50 ratio; there will be performance issues.
+	# Expect reads to have min avgs in the 10G area.  Writes will still be crappy but should not
+	# be as heavily impacted.
+	if CONFIGJ['current'] == "partTest_25p":
+		wlprint("#### Partition Test at 25%")
+		namespaces = list_namespace()
+
+		pmems = []
+		for namespace in namespaces:
+			try:
+				pmems.append("/dev/%s" % str(namespace['blockdev']))
+			except:
+				wlprint("ERROR: partTest_25p could not add namespace entry: `%s`" % str(namespace))
+				sys.exit(11)
+
+		parttest = performPartitionTest(pmems, "write")
+		if parttest:
+			wlprint("ERROR: partTest_25p failed performPartitionTest")
+			sys.exit(12)
+
+		for disk in pmems:
+			partP = disk.split("/")[-1]
+			partE = "%sp1" % disk
+			partEP = partE.split("/")[-1]
+			for fs in [ "xfs", "btrfs", "ext4" ]:
+				validation = validateResults(validateResultsInData(writebw=(1100*1000000)),formulateResults(FIOOutFile + partEP + fs + "write"))
+				if validation:
+					wlprint("ERROR: Throughput validation failed for partTest_25p write")
+					sys.exit(15)
+
+		parttest = performPartitionTest(pmems, "read")
+		if parttest:
+			wlprint("ERROR: partTest_25p failed performPartitionTest")
+			sys.exit(14)
+
+		for disk in pmems:
+			partP = disk.split("/")[-1]
+			partE = "%sp1" % disk
+			partEP = partE.split("/")[-1]
+			for fs in [ "xfs", "btrfs", "ext4" ]:
+				validation = validateResults(validateResultsInData(readbw=(5200*1000000)),formulateResults(FIOOutFile + partEP + fs + "read"))
+				if validation:
+					wlprint("ERROR: Throughput validation failed for partTest_25p read")
+					sys.exit(15)
+
+		nextTestPass(CONFIGFP, CONFIGJ)
+
+	if CONFIGJ['current'] == "goal_clear_25p":
+		wlprint("#### Clearing 25% goal")
+		if delete_all():
+			wlprint("ERROR: Could not delete all namespaces")
+			sys.exit(16)
+
+		clearGoal(ignore=True)
+
+		CONFIGJ = nextTest(CONFIGJ)
+		writeConfig(CONFIGJ, CONFIGFP)
+		# out = setGoal(100, "AppDirectNotInterleaved", None, True)
+		out = setGoal(100, None, None, True)
+		if out:
+			wlprint("ERROR: Could not set goal during initialization.")
+			sys.exit(17)
+
+		time.sleep(180)
+		sys.exit(0)
+
+
+#75% Goal tests
+	if CONFIGJ['current'] == "goal_75p":
+		wlprint("#### Beginning 75% memorymode goal")
+
+		# if delete_all():
+		# 	wlprint("ERROR: Could not delete all namespaces")
+		# 	sys.exit(16)
+
+#DISABLING DIAGNOSTICS INITIALLY.  THESE SHOULD RUN IN PRODUCTION
+		# out = diagnostics(CONFIGJ)
+		# if out:
+		# 	wlprint("Diagnostic sequence failed for 25% MM goal.")
+		# 	sys.exit(3)
+
+		#Just call clearGoal; let it do whatever.  We don't care about return codes
+		clearGoal(ignore=True)
+
+		#We're also rebooting
+		CONFIGJ = nextTest(CONFIGJ)
+		CONFIGJ['goal'] = 75
+
+
+		writeConfig(CONFIGJ, CONFIGFP)
+		out = setGoal(CONFIGJ['goal'], "AppDirectNotInterleaved", None, True)
+		if out:
+			wlprint("ERROR: Could not set goal during initialization.")
+			sys.exit(17)
+
+		#Patrick
+		#Sleep for 3 minutes and then exit hard
+		time.sleep(180)
+		sys.exit(0)
+
+	if CONFIGJ['current'] == "gval_75p":
+		wlprint("#### Validating 75% goal")
+		#No reboot
+		if compareRegionToGoal(CONFIGJ['goal'], False):
+			wlprint("ERROR: Goal does not match region dump.")
+			sys.exit(18)
+
+		CONFIGJ['regions'] = getRegionDetails()
+		nextTestPass(CONFIGFP, CONFIGJ)
+
+#Performance test at 75%
+	if CONFIGJ['current'] == "perfTest_75p":
+		wlprint("#### Performance Test at 75%")
+		if createAllNamespaces(list_region()):
+			wlprint("ERROR: perfTest_75p failed when creating namespaces")
+			sys.exit(19)
+
+		namespaces = list_namespace()
+
+		pmems = []
+		for namespace in namespaces:
+			try:
+				pmems.append("/dev/%s" % str(namespace['blockdev']))
+			except:
+				wlprint("ERROR: perfTest_75p could not add namespace entry: `%s`" % str(namespace))
+				sys.exit(20)
+
+
+		if performIO(pmems, "write", True):
+			wlprint("ERROR: perftest_75p could not perform IO against `%s`" % str(pmems))
+			sys.exit(21)
+
+		#If we're operating in 50/50 mode; we may need to deal with extremely high read drops due to
+		# the memory getting utilized.
+
+		validation = validateResults(validateResultsInData(writebw=(1100*len(pmems)*1000000)),formulateResults(FIOOutFile))
+		if validation:
+			wlprint("ERROR: Throughput validation failed for perfTest_75p write")
+
+		if performIO(pmems, "read", True):
+			wlprint("ERROR: perftest_75p could not perform read IO against `%s`" % str(pmems))
+			sys.exit(22)
+
+		#Lowered to 15GB due to some inconsistencies that appear.
+		# As long as we're only sampling once; this is always a possibility.
+		validation = validateResults(validateResultsInData(readbw=(15000*len(pmems)*1000000)),formulateResults(FIOOutFile))
+		if validation:
+			wlprint("ERROR: Throughput validation failed for perfTest_75p read")
+			sys.exit(23)
+
+		nextTestPass(CONFIGFP, CONFIGJ)
+
+	# With caching overhead from the 50/50 ratio; there will be performance issues.
+	# Expect reads to have min avgs in the 10G area.  Writes will still be crappy but should not
+	# be as heavily impacted.
+	if CONFIGJ['current'] == "partTest_75p":
+		wlprint("#### Partition Test at 75%")
+		namespaces = list_namespace()
+
+		pmems = []
+		for namespace in namespaces:
+			try:
+				pmems.append("/dev/%s" % str(namespace['blockdev']))
+			except:
+				wlprint("ERROR: partTest_75p could not add namespace entry: `%s`" % str(namespace))
+				sys.exit(11)
+
+		parttest = performPartitionTest(pmems, "write")
+		if parttest:
+			wlprint("ERROR: partTest_75p failed performPartitionTest")
+			sys.exit(12)
+
+		for disk in pmems:
+			partP = disk.split("/")[-1]
+			partE = "%sp1" % disk
+			partEP = partE.split("/")[-1]
+			for fs in [ "xfs", "btrfs", "ext4" ]:
+				validation = validateResults(validateResultsInData(writebw=(1100*1000000)),formulateResults(FIOOutFile + partEP + fs + "write"))
+				if validation:
+					wlprint("ERROR: Throughput validation failed for partTest_75p write")
+					sys.exit(15)
+
+		parttest = performPartitionTest(pmems, "read")
+		if parttest:
+			wlprint("ERROR: partTest_75p failed performPartitionTest")
+			sys.exit(14)
+
+		for disk in pmems:
+			partP = disk.split("/")[-1]
+			partE = "%sp1" % disk
+			partEP = partE.split("/")[-1]
+			for fs in [ "xfs", "btrfs", "ext4" ]:
+				validation = validateResults(validateResultsInData(readbw=(5200*1000000)),formulateResults(FIOOutFile + partEP + fs + "read"))
+				if validation:
+					wlprint("ERROR: Throughput validation failed for partTest_75p read")
+					sys.exit(15)
+
+		nextTestPass(CONFIGFP, CONFIGJ)
+
+	if CONFIGJ['current'] == "goal_clear_75p":
+		wlprint("#### Clearing 75% goal")
+		if delete_all():
+			wlprint("ERROR: Could not delete all namespaces")
+			sys.exit(16)
+
+		clearGoal(ignore=True)
+
+		CONFIGJ = nextTest(CONFIGJ)
+		writeConfig(CONFIGJ, CONFIGFP)
+		# out = setGoal(100, "AppDirectNotInterleaved", None, True)
+		out = setGoal(100, None, None, True)
+		if out:
+			wlprint("ERROR: Could not set goal during initialization.")
+			sys.exit(17)
+
+		time.sleep(180)
+		sys.exit(0)
+
+
+	# #100% memory goal is easy to test
+	# if CONFIGJ['current'] == "goal_100p":
+	# 	#Reboots
+	# 	pass
+
+	# if CONFIGJ['current'] == "gval_100p":
+	# 	#No reboot
+	# 	pass
+
+	# #I'd like to add locking here and unlocking
+
+	wlprint("Tests completed successfully.")
+	wlprint("View logs in /var/log/green_fireball.log")
+	wlprint("End of Test.")

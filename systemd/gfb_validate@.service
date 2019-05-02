@@ -1,0 +1,29 @@
+[Unit]
+Description=GFB_Validate on %I
+After=systemd-user-sessions.service plymouth-quit-wait.service
+After=rc-local.service
+Conflicts=getty@tty2.service
+Before=getty.target
+IgnoreOnIsolate=yes
+ConditionPathExists=/dev/tty2
+
+[Service]
+User=root
+Group=root
+WorkingDirectory=/root/green_fireball
+ExecStart=/usr/bin/python2.7 /root/green_fireball/gfb_validate -l /var/log/greenfireball.log -d /root/green_fireball/run --nowarn --tty %I
+Type=simple
+StandardInput=tty-force
+StandardOutput=inherit
+StandardError=inherit
+UtmpIdentifier=%I
+TTYPath=/dev/%I
+KillMode=process
+IgnoreSIGPIPE=no
+SendSIGHUP=yes
+Environment=LANG= LANGUAGE= LC_CTYPE= LC_NUMERIC= LC_TIME= LC_COLLATE= LC_MONETARY= LC_MESSAGES= LC_PAPER= LC_NAME= LC_ADDRESS= LC_TELEPHONE= LC_MEASUREMENT= LC_IDENTIFICATION=
+
+[Install]
+WantedBy=getty.target
+DefaultInstance=tty2
+

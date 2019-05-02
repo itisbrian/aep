@@ -1,0 +1,11 @@
+#!/bin/bash
+#
+# This is the installer for gfb validator
+#
+
+cd /root/green_fireball/pg-generic-py
+python setup.py install
+if [ $? -ne 0 ]; then
+	echo "ERROR Installing pggenericpy"
+	exit 1
+fi

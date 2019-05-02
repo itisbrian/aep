@@ -1,0 +1,25 @@
+#!/bin/bash
+
+#stop and disable service
+
+function gfb_stop () {
+
+systemctl stop gfb_validate@tty7
+if [ $? -ne 0 ]; then
+    echo "Errors found, failed to stop service."
+else
+    echo "Service stopped."
+fi
+
+systemctl disable gfb_validate@tty7
+if [ $? -ne 0 ]; then
+    echo "Errors found, failed to disable service."
+else
+    echo "Service disabled."
+fi
+
+
+
+}
+
+gfb_stop

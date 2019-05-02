@@ -1,0 +1,32 @@
+#!/bin/bash
+
+#Enable the service and start the test.
+#enable, and start
+
+
+function gfb_start () {
+
+systemctl enable gfb_validate@tty7
+if [ $? -ne 0 ] ; then
+    echo "Errors found, failed to enable service."
+else 
+    echo "Serivce enable successful."
+fi
+
+systemctl start gfb_validate@tty7
+if [ $? -ne 0 ] ; then
+    echo "Errors found, failed to start service."
+else
+    echo "Service start successful."
+fi
+
+
+
+
+
+}
+
+
+
+gfb_start 
+
